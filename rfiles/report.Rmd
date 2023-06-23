@@ -1,0 +1,569 @@
+---
+title: "Interactions with GPs"
+author: "GK"
+date: "2023-05-12"
+output: html_document
+---
+
+```{r packages, include=FALSE, message=FALSE, warning=FALSE}
+library(INLA)
+library(sf)
+library(spdep)
+library(fields)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+```
+
+# An SPDEs approach to model the synergy between temperature and air-pollution on health
+
+## Simulation
+We can create 3-5 simulation scenarios based on real-life examples. A recent paper by the MCMC group used some sort of 2d splines to model interactions for ~500 cities and 2 health outcomes (respiratory and cardiovascular mortality). What we could do is simulate N scenarios based on the surfaces of that paper and fit an spde and the regular interaction model and compare. We will use the Italian dataset as the basis of the interaction. The linear effect of PM10, the non-linear effect of temperature, the effect of national holidays and the spatiotemporal trends could be either determined by the model without the interaction or using the literature. 
+
+We can have 2 subsequent papers based on this:
+1. An applied one where we do this for COPD
+2. An extension of this approach is DLNMs in space (3-way interaction)
+
+## Description
+
+I will develop 3 main interaction models:
+
+- Regular
+- Linear
+- Flexible
+To model the synergistic effect of PM$_{10}$ and temperature on all cause-mortality in Italy.
+
+```{r data}
+dat <- readRDS("ItalyData")
+shp <- readRDS("shp")
+W.nb <- spdep::poly2nb(shp)
+spdep::nb2INLA("W.adj", W.nb)
+theta <- NULL
+
+dat$temp_id <- inla.group(dat$temperature_lag0_3, method = "cut", n = 50)
+dat$pm_id <- inla.group(dat$pm10_lag0_3, method = "cut", n = 50)
+dat$datid <- as.numeric(as.factor(dat$date))
+dat$year_cont <-  dat$year - min(dat$year) + 1 
+dat$space_id <- as.numeric(as.factor(dat$SIGLA))
+
+hyper.iid <- list(theta=list(prior="pc.prec", param=c(0.1, 0.01)))
+hyper.bym <- list(theta1=list("PCprior", c(1, 0.01)), theta2 = list("PCprior", c(0.5, 0.5)))
+control.family <- inla.set.control.family.default()
+```
+
+## No interaction model
+
+### INLA model
+
+```{r noint}
+form_nointeraction = 
+  deaths ~ 
+  offset(log(expected)) + 
+  as.factor(hol) + 
+  year_cont + 
+  f(datid, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  f(space_id, model = "bym2", graph = "W.adj", scale.model = TRUE, hyper = hyper.bym, constr = TRUE) +
+  f(temp_id, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  pm10_lag0_3
+  # f(pm_id, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) this is the non linear alternative which justifies the linearity assumption
+
+inla(form_nointeraction, 
+     data = dat, 
+     family = "Poisson",
+     control.family = control.family, 
+     verbose = FALSE,
+     num.threads = 2, 
+     control.compute = list(config = TRUE), 
+     control.predictor = list(link=1), 
+     control.mode = list(theta=theta, restart=TRUE)
+     ) -> mod1
+
+```
+The effect is 0.2% increase in the mortality risk for every unit increase in the PM10
+### Extract results
+```{r res_noint}
+
+shp$ID <- as.numeric(as.factor(shp$SIGLA))
+shp <- left_join(shp, mod1$summary.random$space_id)
+
+ggplot(data = mod1$summary.random$temp_id) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()|
+
+ggplot(data = shp) + 
+  geom_sf(aes(fill = mean)) + 
+  scale_fill_viridis_c() + 
+  theme_bw()|
+
+ggplot(data = mod1$summary.random$datid) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()
+
+shp <- shp[,1:6]
+
+summary(mod1)
+
+```
+## Regular interaction model
+
+### INLA model
+
+```{r regint}
+dat$pol_temp <- scale(dat$pm10_lag0_3*dat$temperature_lag0_3)
+sd(dat$pm10_lag0_3*dat$temperature_lag0_3)
+
+form_regint = 
+  deaths ~ 
+  offset(log(expected)) + 
+  as.factor(hol) + 
+  year_cont + 
+  f(datid, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  f(space_id, model = "bym2", graph = "W.adj", scale.model = TRUE, hyper = hyper.bym, constr = TRUE) +
+  f(temp_id, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  pm10_lag0_3 +
+  pol_temp
+
+inla(form_regint, 
+     data = dat, 
+     family = "Poisson",
+     control.family = control.family, 
+     verbose = FALSE,
+     num.threads = 2, 
+     control.compute = list(config = TRUE), 
+     control.predictor = list(link=1), 
+     control.mode = list(theta=theta, restart=TRUE)
+     ) -> mod2
+
+```
+
+### Extract results
+```{r res_regint, fig.width = 8}
+
+shp$ID <- as.numeric(as.factor(shp$SIGLA))
+shp <- left_join(shp, mod2$summary.random$space_id)
+
+ggplot(data = mod2$summary.random$temp_id) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()|
+
+ggplot(data = shp) + 
+  geom_sf(aes(fill = mean)) + 
+  scale_fill_viridis_c() + 
+  theme_bw()|
+
+ggplot(data = mod2$summary.random$datid) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()
+
+shp <- shp[,1:6]
+
+summary(mod2)
+
+```
+The interaction is significant and it is 0.028/200 (0.014/200, 0.042/200), ie 0.014% (0.07%, 0.021%) meaning that across the different temperature levels there is roughly a 0.014% increase in the effect of PM. I have to notice that this implies that there is a constant linear effect of pm across the levels of temperature, that the effect of temperature remains unchanged but the effect of air-pollution goes away, as it get (part of it) inherited in the interaction.
+
+### Interaction plots
+```{r res_regint_complot, fig.width = 10}
+N <- 100
+
+# mod2$summary.fixed$`0.5quant`[5] # the slope of the scaled interaction. This can be multiplied with the scaled PM and give us different slopes
+pm_grid <- seq(from = min(dat$pm10_lag0_3), to = max(dat$pm10_lag0_3), length.out = N)
+temp_grid <- seq(from = min(dat$temperature_lag0_3), to = max(dat$temperature_lag0_3), length.out = N)
+
+line_temp <- list()
+for(i in 1:N){
+  line_temp[[i]] <- mod2$summary.fixed$`0.5quant`[1] + pm_grid[i]*temp_grid*mod2$summary.fixed$`0.5quant`[5]/sd(dat$pm10_lag0_3*dat$temperature_lag0_3)
+}
+
+line_temp_dat <- data.frame(
+  RR = exp(do.call(c, line_temp)), 
+  temperature = rep(temp_grid, times = N), 
+  PM10 = rep(pm_grid, each = N)
+)
+
+ggplot() + geom_line(data = line_temp_dat, aes(x = temperature, y = RR, group = PM10, col = PM10)) + theme_bw() + 
+  scale_color_viridis_c() + ylab("SMR") + ylim(c(0.5, 1.2))-> p1
+
+slopes_temp <-
+  data.frame(
+    slope = pm_grid*mod2$summary.fixed$`0.5quant`[5]/sd(dat$pm10_lag0_3*dat$temperature_lag0_3),
+    temperature = pm_grid, 
+    highslope = pm_grid*mod2$summary.fixed$`0.975quant`[5]/sd(dat$pm10_lag0_3*dat$temperature_lag0_3),
+    lowsplope =   pm_grid*mod2$summary.fixed$`0.025quant`[5]/sd(dat$pm10_lag0_3*dat$temperature_lag0_3)
+  )
+
+ggplot() + 
+#  geom_point(data = slopes_temp, aes(x = temperature, y = slope), size = 0.6) + 
+  geom_line(data = slopes_temp, aes(x = temperature, y = slope)) + 
+  # geom_line(data = slopes_temp, aes(x = temperature, y = lowsplope)) +
+  # geom_line(data = slopes_temp, aes(x = temperature, y = highslope)) + 
+  geom_ribbon(data=slopes_temp, aes(x=temperature,ymin=lowsplope,ymax=highslope), fill = "lightblue",alpha = 0.5) + ylab("Slopes Temperature") + ylim(c(-0.015, 0.020)) +
+  theme_bw() -> p2
+
+expand.grid(
+  pm10 = pm_grid, 
+  temperature = temp_grid
+) -> gridint
+gridint$SMR <- exp(gridint$pm10*gridint$temperature*mod2$summary.fixed$`0.5quant`[5]/sd(dat$pm10_lag0_3*dat$temperature_lag0_3) + 
+                     mod2$summary.fixed$`0.5quant`[1])
+                
+ggplot() + geom_tile(data = gridint, aes(x = temperature, y = pm10, fill = SMR)) + theme_bw() + 
+  scale_fill_viridis_c() -> p3
+
+     
+P1 <- p1|p2|p3
+P1
+
+boxcomp_regint <- gridint$SMR
+```
+
+
+## Linear interaction model
+
+### INLA model
+
+```{r linear_int}
+cut_var <- 30
+dat$temp_id_int <- inla.group(dat$temperature_lag0_3, method = "cut", n = cut_var)
+
+form_linear_int = 
+  deaths ~ 
+  offset(log(expected)) + 
+  as.factor(hol) + 
+  year_cont + 
+  f(datid, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  f(space_id, model = "bym2", graph = "W.adj", scale.model = TRUE, hyper = hyper.bym, constr = TRUE) +
+  f(temp_id, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  pm10_lag0_3 + 
+  f(temp_id_int, pm10_lag0_3, model = "rw2", hyper = hyper.iid, constr = TRUE)
+
+
+inla(form_linear_int, 
+     data = dat, 
+     family = "Poisson",
+     control.family = control.family, 
+     verbose = FALSE,
+     num.threads = 2, 
+     control.compute = list(config = TRUE), 
+     control.predictor = list(link=1), 
+     control.mode = list(theta=theta, restart=TRUE)
+     ) -> mod4
+
+```
+
+### Extract results
+```{r res_linear_int, fig.width = 8}
+
+shp$ID <- as.numeric(as.factor(shp$SIGLA))
+shp <- left_join(shp, mod4$summary.random$space_id)
+
+ggplot(data = mod4$summary.random$temp_id) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()|
+
+ggplot(data = shp) + 
+  geom_sf(aes(fill = mean)) + 
+  scale_fill_viridis_c() + 
+  theme_bw()|
+
+ggplot(data = mod4$summary.random$datid) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()
+
+shp <- shp[,1:6]
+
+```
+
+```{r res_linear_int2}
+summary(mod4)
+```
+
+The above needs to be done more properly but the idea is there.
+
+### Interaction plots
+
+```{r res_linint_complot, fig.width = 10}
+N <- dat$temp_id_int %>% unique() %>% length()
+
+line_temp <- list()
+line_temp_low <- list()
+line_temp_high <- list()
+
+for(i in 1:N){
+  line_temp[[i]] <- mod4$summary.fixed$`0.5quant`[1] + mod4$summary.random$temp_id_int$`0.5quant`[i]*pm_grid
+  
+  line_temp_high[[i]] <- mod4$summary.fixed$`0.5quant`[1] + mod4$summary.random$temp_id_int$`0.975quant`[i]*pm_grid
+  
+    line_temp_low[[i]] <- mod4$summary.fixed$`0.5quant`[1] + mod4$summary.random$temp_id_int$`0.025quant`[i]*pm_grid
+}
+
+line_temp_dat <- data.frame(
+  RR = exp(do.call(c, line_temp)), 
+  RR_low = exp(do.call(c, line_temp_low)), 
+  RR_high = exp(do.call(c, line_temp_high)), 
+  PM10 = rep(pm_grid, times = N), 
+  Temperature = rep(mod4$summary.random$temp_id_int$ID, each = 100)
+)
+
+
+
+ggplot() + geom_line(data = line_temp_dat, 
+                     aes(x = Temperature, y = RR, group = PM10, col = PM10)) +
+  scale_color_viridis_c() + 
+  scale_fill_viridis_c() + 
+  ylab("SMR") + 
+    theme_bw() + ylim(c(0.5, 1.2)) -> p1
+
+
+slopes_temp <-
+  data.frame(
+    slope = 
+      mod4$summary.random$temp_id_int$`0.5quant`,
+    temperature = mod4$summary.random$temp_id_int$ID, 
+    highslope = 
+      mod4$summary.random$temp_id_int$`0.975quant`,
+    lowsplope = 
+      mod4$summary.random$temp_id_int$`0.025quant`
+  )
+
+ggplot() + 
+#  geom_point(data = slopes_temp, aes(x = temperature, y = slope), size = 0.6) + 
+  geom_line(data = slopes_temp, aes(x = temperature, y = slope)) + 
+  # geom_line(data = slopes_temp, aes(x = temperature, y = lowsplope)) +
+  # geom_line(data = slopes_temp, aes(x = temperature, y = highslope)) + 
+  geom_ribbon(data=slopes_temp, aes(x=temperature,ymin=lowsplope,ymax=highslope), fill = "lightblue",alpha = 0.5) + ylim(c(-0.015, 0.015)) + 
+  theme_bw() -> p2
+
+expand.grid(
+  pm10 = pm_grid, 
+  temperature = mod4$summary.random$temp_id_int$ID
+) -> gridint
+
+gridint <- left_join(gridint, mod4$summary.random$temp_id_int, by = c("temperature" = "ID"))
+gridint$SMR <- exp(gridint$pm10*gridint$`0.5quant` + 
+                     mod4$summary.fixed$`0.5quant`[1])
+                
+ggplot() + geom_tile(data = gridint, aes(x = temperature, y = pm10, fill = SMR)) + theme_bw() + 
+  scale_fill_viridis_c() -> p3
+
+     
+P3 <- p1|p2|p3
+P3
+
+boxcomp_linint <- gridint$SMR
+```
+
+
+## SPDE interaction model
+
+### Prepare data
+
+```{r spde_int}
+
+cut_var <- 30
+dat$temp_id_int <- inla.group(dat$temperature_lag0_3, method = "cut", n = cut_var)
+dat$pm_id_int <- inla.group(dat$pm10_lag0_3, method = "cut", n = cut_var)
+
+dat$interaction_id <- paste0(dat$temp_id_int, dat$pm_id_int)
+dat$interaction_id <- as.numeric(as.factor(dat$interaction_id))
+max(dat$interaction_id) # this is not cut_var^2 as there is no data in all pixels but this is fine for the iid
+
+dat$temp_id2 <- dat$temp_id
+
+dat$pm_id_factor <- dat$pm_id_int %>% as.factor() %>% as.numeric()
+dat$temp_id_factor <- dat$temp_id_int %>% as.factor() %>% as.numeric()
+
+expand.grid(
+  x = unique(dat$pm_id_factor), 
+  y = unique(dat$temp_id_factor)
+) -> mock_shp
+
+## ok lets generate the mesh. We can have two meshes, one to predict everywhere and the second 
+# to be limited with the points available. 
+locs <- unique(dat[, c("temp_id_factor", "pm_id_factor")])
+colnames(locs) <- c("x", "y")
+ 
+# mesh
+set.seed(2)
+# mesh <- inla.mesh.2d(loc.domain = locs, max.edge = c(1, 15), n = 4,
+#                      offset = c(0.5, 0.3)) 
+mesh <- inla.mesh.2d(loc.domain = locs, max.edge = c(1.5, 10),
+                     offset = c(2, 0.1)) 
+
+plot(mesh)
+points(mock_shp$x, 
+       mock_shp$y, col = "blue", cex = 0.5, pch = 19)
+points(locs, col = "red", pch = 18)
+
+
+# == projector matrix ==
+# projector matrix
+A <- inla.spde.make.A(mesh = mesh,
+                            loc = dat[, c("temp_id_factor", "pm_id_factor")] %>% as.matrix())
+
+# == model definition ==
+# spde model
+rf <- inla.spde2.pcmatern(mesh = mesh,
+                          prior.range = c(0.1,0.01),
+                          prior.sigma = c(1,0.01), 
+                          constr = TRUE)
+
+
+# stack 
+stk <- inla.stack(data = list(deaths = dat$deaths),
+                  A = list(A, 1),
+                  effects = list(list(field = 1:rf$n.spde),
+                                 data.frame(
+                                   expected = dat$expected,
+                                   hol = dat$hol,
+                                   year_cont = dat$year_cont,
+                                   datid = dat$datid, 
+                                   space_id = dat$space_id,
+                                   temp_id = dat$temp_id,
+                                   pm10_lag0_3 = dat$pm10_lag0_3)
+                                 ), tag = "mod")
+
+```
+
+### INLA model
+
+```{r spde_mod}
+
+form_spde_int = 
+  deaths ~ 
+  offset(log(expected)) + 
+  as.factor(hol) + 
+  year_cont + 
+  f(datid, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  f(space_id, model = "bym2", graph = "W.adj", scale.model = TRUE, hyper = hyper.bym, constr = TRUE) +
+  f(temp_id, model = "rw2", hyper = hyper.iid, constr = TRUE, scale.model = TRUE) + 
+  pm10_lag0_3 + 
+  f(field, model = rf)
+
+
+inla(form_spde_int, 
+     data = inla.stack.data(stk), 
+     family = "Poisson",
+     control.family = control.family, 
+     verbose = FALSE,
+     num.threads = 2, 
+     control.fixed = list(prec.intercept = 5, mean.intercept = 0),
+     control.compute = list(config = TRUE), 
+     control.predictor = list(link=1, compute = TRUE, A = inla.stack.A(stk)), 
+     control.mode = list(theta=c(-1.19, 5.45, -2.37, 5.92, 4.35, -2.66), restart=TRUE)
+     ) -> mod5
+
+summary(mod5)
+
+```
+
+### Extract results
+```{r spde_res, fig.width=9, fig.height=4}
+ggplot(data = mod5$summary.random$temp_id) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()|
+
+ggplot(data = mod5$summary.random$space_id[1:101,]) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()|
+
+ggplot(data = mod5$summary.random$datid) + 
+  geom_line(aes(x=ID, y=mean)) + 
+  geom_line(aes(x=ID, y=`0.025quant`)) + 
+  geom_line(aes(x=ID, y=`0.975quant`)) + theme_bw()
+
+```
+
+```{r spde_res2}
+
+N_plot <- 200
+# x is temperature
+# y is PM10
+
+proj = inla.mesh.projector(mesh, xlim=c(0,cut_var), ylim=c(0,cut_var), dims=c(N_plot, N_plot))
+field.proj = inla.mesh.project(proj, mod5$summary.random[['field']][['mean']])
+# image.plot(list(x = proj$x, y=proj$y, z = exp(field.proj)), col = plasma(101))
+
+field.proj_sd = inla.mesh.project(proj, mod5$summary.random[['field']][['sd']])
+# image.plot(list(x = proj$x, y=proj$y, z = field.proj_sd), col = plasma(101))
+
+summary(mod5)
+
+```
+
+
+```{r res_spdeint_complot, fig.width = 10}
+
+Xmat <- as.data.frame(field.proj)
+Xmat$Temperature <- seq(from = min(dat$temperature_lag0_3), to = max(dat$temperature_lag0_3), length.out = N_plot)
+
+data_long <- gather(Xmat, PM10id, RR, V1:V200, factor_key=TRUE)
+dat_merge <- data.frame(PM10id = paste0("V", 1:N_plot), 
+                        PM10 = seq(from = min(dat$pm10_lag0_3), to = max(dat$pm10_lag0_3), length.out = N_plot))
+
+data_long <- left_join(data_long, dat_merge, by = c("PM10id" = "PM10id"))
+data_long$RR_scaled <- exp(data_long$RR)*exp(mod5$summary.fixed$`0.5quant`[1])
+
+ggplot() + geom_line(data = data_long, 
+                     aes(x = Temperature, y = RR_scaled, group = PM10, col = PM10)) +
+  scale_color_viridis_c() + 
+  scale_fill_viridis_c() + 
+  ylab("SMR") + 
+    theme_bw() + 
+  ylim(c(0.5, 1.2)) -> p11
+
+ggplot() + geom_line(data = data_long %>% filter(PM10 < 50), 
+                     aes(x = Temperature, y = RR_scaled, group = PM10, col = PM10)) +
+  scale_color_viridis_c() + 
+  scale_fill_viridis_c() + 
+  ylab("SMR") + 
+    theme_bw() + 
+  ylim(c(0.5, 1.2)) -> p12
+
+# qpm10 <- quantile(dat$pm10_lag0_3, probs = seq(from = 0, to = 1, by = 0.10))
+# data_long$pmcat <- 
+#   cut(data_long$PM10, 
+#       breaks = qpm10, 
+#       include.lowest = TRUE)
+
+# ggplot() + geom_line(data = data_long, 
+#                      aes(x = Temperature, 
+#                          y = RR_scaled, 
+#                          group = pmcat, 
+#                          col = pmcat)) +
+#   scale_color_viridis_d() + 
+#   ylab("SMR") + 
+#     theme_bw() + 
+#   ylim(c(0.5, 1.2)) -> p13
+
+# data_long$pmcat <- data_long$PM10
+# data_long$pmcat[data_long$pmcat >= 55] <- 55
+# 
+# ggplot() + geom_line(data = data_long, 
+#                      aes(x = Temperature, y = RR_scaled, group = pmcat, col = pmcat)) +
+#   scale_color_viridis_c() + 
+#   ylab("SMR") + 
+#     theme_bw() + 
+#   ylim(c(0.5, 1.2)) -> p13
+
+ggplot() + geom_tile(data = data_long, aes(x = Temperature, y = PM10, fill = RR_scaled)) + theme_bw() + 
+  scale_fill_viridis_c() + labs(fill=NULL)-> p3
+
+     
+P4 <- p1|p3
+P4
+
+```
+
+```{r res_spdeint_boxplot, fig.width = 5}
+boxplot(boxcomp_regint, boxcomp_linint, exp(data_long$RR)*exp(mod5$summary.fixed$`0.5quant`[1]))
+```
